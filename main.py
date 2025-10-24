@@ -17,10 +17,35 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 ORDER_SIZE_USDT = float(os.getenv("ORDER_SIZE_USDT", "5.0"))
 LEVERAGE = int(os.getenv("LEVERAGE", "25"))
-MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "6"))
+MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "5"))
 TIMEFRAME = os.getenv("TIMEFRAME", "5m")
 MIN_PROFIT_PERCENT = float(os.getenv("MIN_PROFIT_PERCENT", "0.5"))
 MIN_BALANCE_USDT = float(os.getenv("MIN_BALANCE_USDT", "15.0"))
+COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "120"))
+
+if TIMEFRAME == "1m":
+    ATR_WINDOW = 7
+    RSI_WINDOW = 3
+    HISTORY_LIMIT = 150
+elif TIMEFRAME == "3m":
+    ATR_WINDOW = 10
+    RSI_WINDOW = 4
+    HISTORY_LIMIT = 200
+else:
+    ATR_WINDOW = 14
+    RSI_WINDOW = 5
+    HISTORY_LIMIT = 250
+
+pnl_stats = {
+    "total_trades": 0,
+    "winning_trades": 0,
+    "losing_trades": 0,
+    "total_pnl": 0.0,
+    "biggest_win": 0.0,
+    "biggest_loss": 0.0
+}
+
+last_entry_time = {}
 
 exchange = ccxt.bybit({
     "apiKey": API_KEY,
@@ -60,8 +85,10 @@ def get_balance():
 def now():
     return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
-def fetch_ohlcv(symbol, limit=50):
+def fetch_ohlcv(symbol, limit=None):
     try:
+        if limit is None:
+            limit = HISTORY_LIMIT
         bars = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=limit)
         df = pd.DataFrame(bars, columns=["timestamp", "open", "high", "low", "close", "volume"])
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
@@ -72,11 +99,13 @@ def fetch_ohlcv(symbol, limit=50):
 
 def calculate_indicators(df):
     try:
-        df['EMA20'] = ta.trend.ema_indicator(df['close'], window=20)
-        df['EMA50'] = ta.trend.ema_indicator(df['close'], window=50)
-        df['RSI'] = ta.momentum.rsi(df['close'], window=14)
-        atr = ta.volatility.AverageTrueRange(df['high'], df['low'], df['close'], window=14)
+        df['EMA9'] = ta.trend.ema_indicator(df['close'], window=9)
+        df['EMA21'] = ta.trend.ema_indicator(df['close'], window=21)
+        df['EMA200'] = ta.trend.ema_indicator(df['close'], window=200)
+        df['RSI'] = ta.momentum.rsi(df['close'], window=RSI_WINDOW)
+        atr = ta.volatility.AverageTrueRange(df['high'], df['low'], df['close'], window=ATR_WINDOW)
         df['ATR'] = atr.average_true_range()
+        df['volume_ema'] = df['volume'].ewm(span=20).mean()
         return df
     except Exception as e:
         print(f"{now()} ❌ Помилка розрахунку індикаторів: {e}")
@@ -125,7 +154,43 @@ def round_to_tick(price, tick_size, round_up=True):
     else:
         return math.floor(price / tick_size) * tick_size
 
-def close_position(symbol, side):
+def update_pnl_stats(pnl, trade_type="manual"):
+    global pnl_stats
+    pnl_stats["total_trades"] += 1
+    pnl_stats["total_pnl"] += pnl
+    
+    if pnl > 0:
+        pnl_stats["winning_trades"] += 1
+        if pnl > pnl_stats["biggest_win"]:
+            pnl_stats["biggest_win"] = pnl
+    else:
+        pnl_stats["losing_trades"] += 1
+        if pnl < pnl_stats["biggest_loss"]:
+            pnl_stats["biggest_loss"] = pnl
+    
+    winrate = (pnl_stats["winning_trades"] / pnl_stats["total_trades"] * 100) if pnl_stats["total_trades"] > 0 else 0
+    print(f"{now()} 📊 PnL: {pnl:+.2f} USDT | Total: {pnl_stats['total_pnl']:+.2f} USDT | Winrate: {winrate:.1f}% ({pnl_stats['winning_trades']}/{pnl_stats['total_trades']})")
+
+def print_pnl_stats():
+    if pnl_stats["total_trades"] == 0:
+        return
+    winrate = pnl_stats["winning_trades"] / pnl_stats["total_trades"] * 100
+    msg = (
+        f"\n{'='*60}\n"
+        f"📊 PnL СТАТИСТИКА:\n"
+        f"{'='*60}\n"
+        f"Всього угод: {pnl_stats['total_trades']}\n"
+        f"Прибуткових: {pnl_stats['winning_trades']} | Збиткових: {pnl_stats['losing_trades']}\n"
+        f"Winrate: {winrate:.2f}%\n"
+        f"Загальний PnL: {pnl_stats['total_pnl']:+.2f} USDT\n"
+        f"Найбільший профіт: +{pnl_stats['biggest_win']:.2f} USDT\n"
+        f"Найбільший збиток: {pnl_stats['biggest_loss']:.2f} USDT\n"
+        f"{'='*60}\n"
+    )
+    print(msg)
+    send_telegram(msg.replace('=', '─'))
+
+def close_position(symbol, side, reason="manual", entry_price=None):
     try:
         positions = exchange.fetch_positions([symbol])
         for pos in positions:
@@ -138,15 +203,70 @@ def close_position(symbol, side):
             if abs(actual_size) > 0:
                 amount = abs(actual_size)
                 close_side = 'sell' if side == "LONG" else 'buy'
+                
+                ticker = exchange.fetch_ticker(symbol)
+                exit_price = float(ticker['last'])
+                
+                if entry_price:
+                    if side == "LONG":
+                        pnl = (exit_price - entry_price) / entry_price * 100 * ORDER_SIZE_USDT * LEVERAGE
+                    else:
+                        pnl = (entry_price - exit_price) / entry_price * 100 * ORDER_SIZE_USDT * LEVERAGE
+                    update_pnl_stats(pnl)
+                
                 exchange.create_market_order(symbol, close_side, amount, {'reduceOnly': True})
-                print(f"{now()} 🔄 Позицію {symbol} закрито через неможливість встановити TP/SL")
+                print(f"{now()} 🔄 Позицію {symbol} закрито | Причина: {reason}")
+                send_telegram(f"🔄 Закрито {side} {symbol}\nПричина: {reason}\nPnL: {pnl:+.2f} USDT" if entry_price else f"🔄 Закрито {side} {symbol}")
                 return True
         return False
     except Exception as e:
         print(f"{now()} ❌ Помилка закриття позиції {symbol}: {e}")
         return False
 
+def exit_signal(df, side, symbol=""):
+    try:
+        last = df.iloc[-1]
+        prev = df.iloc[-2]
+        
+        ema9 = last['EMA9']
+        ema21 = last['EMA21']
+        rsi = last['RSI']
+        
+        if pd.isna([ema9, ema21, rsi]).any():
+            return False
+        
+        if side == "LONG":
+            if ema9 < ema21:
+                print(f"{now()} 🔴 {symbol} EXIT: EMA9 перетнула EMA21 вниз (було LONG)")
+                return True
+            if rsi < 30:
+                print(f"{now()} 🔴 {symbol} EXIT: RSI перепроданість {rsi:.1f} (було LONG)")
+                return True
+        
+        elif side == "SHORT":
+            if ema9 > ema21:
+                print(f"{now()} 🟢 {symbol} EXIT: EMA9 перетнула EMA21 вгору (було SHORT)")
+                return True
+            if rsi > 70:
+                print(f"{now()} 🟢 {symbol} EXIT: RSI перекупленість {rsi:.1f} (було SHORT)")
+                return True
+        
+        return False
+    except Exception as e:
+        print(f"{now()} ❌ Помилка перевірки exit signal: {e}")
+        return False
+
 def open_position(symbol, side, atr):
+    global last_entry_time
+    
+    current_time = time.time()
+    if symbol in last_entry_time:
+        time_since_last = current_time - last_entry_time[symbol]
+        if time_since_last < COOLDOWN_SECONDS:
+            remaining = COOLDOWN_SECONDS - time_since_last
+            print(f"{now()} ⏳ {symbol} у cooldown, залишилось {remaining:.0f}с")
+            return False
+    
     order_opened = False
     try:
         market = exchange.market(symbol)
@@ -228,12 +348,14 @@ def open_position(symbol, side, atr):
         
         if not tp_sl_success:
             print(f"{now()} 🚨 УВАГА: Закриваю позицію {symbol} через неможливість встановити TP/SL")
-            close_position(symbol, side)
+            close_position(symbol, side, "TP/SL failed")
             send_telegram(f"⚠️ <b>Помилка відкриття позиції</b>\n\n"
                          f"Монета: {symbol}\n"
                          f"Причина: TP/SL не встановлено\n"
                          f"Позицію закрито автоматично")
             return False
+        
+        last_entry_time[symbol] = time.time()
         
         position_value = ORDER_SIZE_USDT * LEVERAGE
         profit_usdt = position_value * tp_percent / 100
@@ -265,18 +387,40 @@ def open_position(symbol, side, atr):
             close_position(symbol, side)
         return False
 
-def signal(df):
+def signal(df, symbol=""):
     try:
         last = df.iloc[-1]
         prev = df.iloc[-2]
         
-        if pd.isna(last['EMA20']) or pd.isna(last['EMA50']) or pd.isna(last['RSI']):
+        ema9 = last['EMA9']
+        ema21 = last['EMA21']
+        ema200 = last['EMA200']
+        rsi = last['RSI']
+        price = last['close']
+        volume = last['volume']
+        vol_ema = last['volume_ema']
+        
+        if pd.isna([ema9, ema21, ema200, rsi, vol_ema]).any():
             return None
         
-        if last['EMA20'] > last['EMA50'] and last['RSI'] > 55 and last['RSI'] < 70:
-            return "LONG"
-        elif last['EMA20'] < last['EMA50'] and last['RSI'] < 45 and last['RSI'] > 30:
-            return "SHORT"
+        print(f"{now()} 🔍 {symbol}: price={price:.2f} | EMA9={ema9:.2f} EMA21={ema21:.2f} EMA200={ema200:.2f} | RSI={rsi:.1f} | vol={volume:.0f} avgVol={vol_ema:.0f}")
+        
+        if volume < vol_ema * 1.1:
+            print(f"{now()}    └─ ❌ Низький об'єм, пропускаю")
+            return None
+        
+        in_uptrend = price > ema200
+        in_downtrend = price < ema200
+        
+        if ema9 > ema21 and in_uptrend and last['close'] > last['open'] and rsi > 45 and rsi < 80:
+            if prev['close'] < last['close']:
+                print(f"{now()}    └─ ✅ LONG сигнал!")
+                return "LONG"
+        
+        if ema9 < ema21 and in_downtrend and last['close'] < last['open'] and rsi < 55 and rsi > 20:
+            if prev['close'] > last['close']:
+                print(f"{now()}    └─ ✅ SHORT сигнал!")
+                return "SHORT"
         
         return None
     except Exception as e:
@@ -285,7 +429,7 @@ def signal(df):
 
 def main():
     print(f"\n{'='*60}")
-    print(f"🤖 Bybit Trading Bot запущено о {now()}")
+    print(f"🤖 Bybit PRO Scalper Bot запущено о {now()}")
     print(f"{'='*60}")
     print(f"⚙️ Налаштування:")
     print(f"  • Режим: {'TESTNET' if TESTNET else 'LIVE'}")
@@ -295,6 +439,17 @@ def main():
     print(f"  • Таймфрейм: {TIMEFRAME}")
     print(f"  • Мін. профіт: {MIN_PROFIT_PERCENT}%")
     print(f"  • Мін. баланс: {MIN_BALANCE_USDT} USDT")
+    print(f"  • Cooldown: {COOLDOWN_SECONDS}с")
+    print(f"\n📊 Індикатори (адаптивні для {TIMEFRAME}):")
+    print(f"  • EMA: 9, 21, 200 (тренд)")
+    print(f"  • RSI({RSI_WINDOW}) - швидкий моментум")
+    print(f"  • ATR({ATR_WINDOW}) - волатильність")
+    print(f"  • Volume EMA(20) - фільтр об'єму")
+    print(f"\n🎯 PRO функції:")
+    print(f"  ✅ Exit signals (EMA cross + RSI reversal)")
+    print(f"  ✅ PnL tracking (winrate, equity)")
+    print(f"  ✅ Cooldown захист")
+    print(f"  ✅ Адаптивні параметри (1m/3m/5m)")
     print(f"{'='*60}\n")
     
     if not API_KEY or not API_SECRET:
@@ -343,6 +498,7 @@ def main():
     
     scan_count = 0
     last_balance_check = time.time()
+    last_pnl_report = time.time()
     
     while True:
         try:
@@ -358,6 +514,31 @@ def main():
                     send_telegram(f"⚠️ <b>Попередження про баланс</b>\n\n{warning_msg}")
                 
                 last_balance_check = time.time()
+            
+            if time.time() - last_pnl_report > 3600 and pnl_stats["total_trades"] > 0:
+                print_pnl_stats()
+                last_pnl_report = time.time()
+            
+            open_positions = get_open_positions()
+            
+            for pos in open_positions:
+                try:
+                    pos_symbol = pos.get('symbol')
+                    contracts = float(pos.get('contracts', 0))
+                    if abs(contracts) == 0:
+                        continue
+                    
+                    pos_side = "LONG" if contracts > 0 else "SHORT"
+                    entry_price = float(pos.get('entryPrice', 0))
+                    
+                    df = fetch_ohlcv(pos_symbol, limit=100)
+                    if df is not None and len(df) > 50:
+                        df = calculate_indicators(df)
+                        if df is not None and exit_signal(df, pos_side, pos_symbol):
+                            close_position(pos_symbol, pos_side, "EXIT signal", entry_price)
+                            time.sleep(1)
+                except Exception:
+                    continue
             
             open_positions = get_open_positions()
             
@@ -379,14 +560,14 @@ def main():
                 
                 try:
                     df = fetch_ohlcv(symbol)
-                    if df is None or len(df) < 50:
+                    if df is None or len(df) < 220:
                         continue
                     
                     df = calculate_indicators(df)
                     if df is None:
                         continue
                     
-                    sig = signal(df)
+                    sig = signal(df, symbol)
                     if sig:
                         print(f"\n{now()} 🎯 Сигнал {sig} для {symbol}")
                         if open_position(symbol, sig, df.iloc[-1]['ATR']):
