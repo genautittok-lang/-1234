@@ -20,7 +20,7 @@ LEVERAGE = int(os.getenv("LEVERAGE", "25"))
 MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "10"))
 TIMEFRAME = os.getenv("TIMEFRAME", "5m")
 MIN_PROFIT_PERCENT = float(os.getenv("MIN_PROFIT_PERCENT", "0.3"))
-MIN_BALANCE_USDT = float(os.getenv("MIN_BALANCE_USDT", "15.0"))
+MIN_BALANCE_USDT = float(os.getenv("MIN_BALANCE_USDT", "10.0"))
 COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "120"))
 
 if TIMEFRAME == "1m":
