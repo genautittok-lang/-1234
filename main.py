@@ -15,7 +15,7 @@ TESTNET = os.getenv("TESTNET", "False").lower() == "true"
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-ORDER_SIZE_USDT = float(os.getenv("ORDER_SIZE_USDT", "10.0"))
+ORDER_SIZE_USDT = float(os.getenv("ORDER_SIZE_USDT", "8.0"))
 LEVERAGE = int(os.getenv("LEVERAGE", "15"))
 MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "5"))
 TIMEFRAME = os.getenv("TIMEFRAME", "5m")
